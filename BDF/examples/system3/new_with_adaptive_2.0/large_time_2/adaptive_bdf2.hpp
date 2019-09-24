@@ -1,0 +1,271 @@
+#ifndef BOOST_NUMERIC_ODEINT_STEPPER_ADAPTIVE_BDF2_HPP_INCLUDED
+#define BOOST_NUMERIC_ODEINT_STEPPER_ADAPTIVE_BDF2_HPP_INCLUDED
+
+#include <boost/numeric/odeint/util/bind.hpp>
+#include <boost/numeric/odeint/util/unwrap_reference.hpp>
+#include <boost/numeric/odeint/stepper/stepper_categories.hpp>
+
+#include <boost/numeric/odeint/util/ublas_wrapper.hpp>
+#include <boost/numeric/odeint/util/is_resizeable.hpp>
+#include <boost/numeric/odeint/util/resizer.hpp>
+#include "bdf2.hpp"
+
+#include <boost/numeric/odeint/algebra/algebra_dispatcher.hpp>
+#include <boost/numeric/odeint/algebra/operations_dispatcher.hpp>
+
+#include <boost/numeric/ublas/matrix.hpp>
+#include <boost/numeric/odeint/stepper/detail/rotating_buffer.hpp>
+#include <boost/numeric/ublas/lu.hpp>
+#include <boost/numeric/ublas/blas.hpp> 
+
+#include <boost/numeric/odeint/stepper/controlled_step_result.hpp>
+
+#define Rtol 1E-3
+
+namespace boost {
+namespace numeric {
+namespace odeint {
+
+template< class state , class value , class Algebra = typename algebra_dispatcher< state >::algebra_type, class Operations = typename operations_dispatcher< state >::operations_type ,class Resizer = initially_resizer >
+class adaptive_bdf2
+{
+
+public:
+
+    typedef value time_type;
+    typedef value value_type;
+    typedef state state_type ;
+    typedef state_wrapper< state_type > wrapped_state_type;
+    typedef state_type deriv_type;
+    typedef state_wrapper< deriv_type > wrapped_deriv_type;
+    typedef boost::numeric::ublas::matrix< value > matrix_type;
+    typedef state_wrapper< matrix_type > wrapped_matrix_type;
+    typedef boost::numeric::ublas::permutation_matrix< size_t > pmatrix_type;
+    typedef state_wrapper< pmatrix_type > wrapped_pmatrix_type;
+    typedef Resizer resizer_type;
+    typedef stepper_tag stepper_category;
+    typedef adaptive_bdf2< state , value , Algebra, Operations, Resizer > stepper_type;
+    
+    typedef detail::rotating_buffer< state_type , 4 > rotbuffer_type_state;
+    typedef detail::rotating_buffer< time_type , 4 > rotbuffer_type_time;
+    typedef detail::rotating_buffer< time_type , 3 > rotbuffer_type_stepsize;
+    
+
+public:
+
+    adaptive_bdf2( value_type epsilon = 1E-8, bool flag = true , int fail_count = 0 ): m_epsilon( epsilon ), 
+    m_flag( flag ) , m_fail ( fail_count )
+    { }
+
+
+    template< typename System >
+    time_type do_step( System system , state_type& x , time_type &t , time_type &dt)
+    {
+        
+        typedef typename odeint::unwrap_reference< System >::type system_type;
+        typedef typename odeint::unwrap_reference< typename system_type::first_type >::type deriv_func_type;
+        typedef typename odeint::unwrap_reference< typename system_type::second_type >::type jacobi_func_type;
+        system_type &sys = system;
+        deriv_func_type &deriv_func = sys.first;
+        jacobi_func_type &jacobi_func = sys.second;   
+        
+        m_resizer.adjust_size( x , detail::bind( &stepper_type::template resize_impl<state_type> , detail::ref( *this ) , detail::_1 ) );
+            
+        for( size_t i=0 ; i<x.size() ; ++i )
+            m_pm.m_v[i] = i;
+        
+        if( m_flag )// setting up values for adaptive_bdf2
+        {  
+            
+            m_previous_state[0] = x; // present state
+            m_previous_time[0] = t;
+
+            bdf2 < state_type, value_type > solver;
+            solver.do_step( system, x, t, dt);// next step
+            
+            m_previous_state[1] = x; // x(n+1)
+            t = t + dt;// t = t(n+1)
+            m_previous_time[1] = t;
+            
+            m_previous_stepsize[0] = dt;
+              
+            solver.do_step( system, x, t, dt); // next step
+             
+            m_previous_state[2] = x;
+            t = t + dt;// t = t(n+2)
+            m_previous_time[2] = t;
+            
+            m_previous_stepsize[1] = dt;
+            
+            m_flag = false;
+            return  -1 ;
+        }
+        else
+        {
+            // calculate next state
+              m_previous_time[2] = t;
+              t = t + dt;
+        
+              m_previous_stepsize[2] = dt;
+
+              w = m_previous_stepsize[2] / m_previous_stepsize[1];
+              alpha = (pow(( 1.0 + w ), 2.0))/(1 + 2 * w);
+              beta = (pow(w, 2.0)/(1 + 2 * w));
+              gamma1 = ( 1 + w )/ ( 1 + 2 * w);
+          
+              deriv_func( m_previous_state[2], m_dxdt.m_v, t);
+              m_b.m_v = gamma1 * m_previous_stepsize[2] * m_dxdt.m_v;
+
+              jacobi_func( m_previous_state[2] , m_jacobi.m_v  , t );
+              m_jacobi.m_v *= m_previous_stepsize[2];
+              m_jacobi.m_v -= boost::numeric::ublas::identity_matrix< value_type >( x.size() );
+
+              solve( m_b.m_v , m_jacobi.m_v );
+
+              m_x.m_v = alpha * m_previous_state[2]- beta * m_previous_state[1] - m_b.m_v; // adaptive_BDF2 formula
+           
+              while( boost::numeric::ublas::norm_2( m_b.m_v ) > m_epsilon )//Newton's iteration for accuracy
+              {
+                  deriv_func( m_x.m_v , m_dxdt.m_v , t );
+                  m_b.m_v = alpha * m_previous_state[2]- beta * m_previous_state[1] - m_x.m_v + gamma1 * m_previous_stepsize[2] * m_dxdt.m_v;
+                  solve( m_b.m_v , m_jacobi.m_v );
+                  m_x.m_v -= m_b.m_v; 
+                      
+              }
+            // m_x.m_v contains next state ( subject to step failure and success )
+               m_previous_state[3] = m_x.m_v;
+             //  for( size_t i = 0 ; i < 3 ; i++ ) std::cout << "dt: " << m_previous_stepsize[i] << "   ";
+               
+               res = try_step( m_previous_state, m_previous_stepsize , dt); 
+
+              if  ( res == success )
+              {
+                   m_previous_state[0] = m_previous_state[1];  // ask for an alternative to these copy steps ( how to use rotate () ? )
+                   m_previous_state[1] = m_previous_state[2];
+                   m_previous_state[2] = m_previous_state[3];
+                   m_previous_state[3] = m_x.m_v;
+                   x = m_x.m_v; 
+                  
+                   m_previous_stepsize[0] = m_previous_stepsize[1];
+                   m_previous_stepsize[1] = m_previous_stepsize[2];
+                   m_previous_stepsize[2] = dt;
+                   m_previous_time[2] = t;
+                   m_fail = 0;
+                   return dt;
+              } 
+              
+              if ( res == fail )
+               {
+                    t = m_previous_time[2];
+                    return 0;
+
+               }
+             
+        }
+ }  
+
+private:
+   
+   controlled_step_result try_step(rotbuffer_type_state &m_previous_state, rotbuffer_type_stepsize &m_previous_stepsize ,time_type &dt)
+   {
+      value_type xerr;  
+      xerr = error_do_step(m_previous_state,m_previous_stepsize);
+      F = 1/xerr;
+      
+      if ( xerr >= 0 && xerr <= 1.2 )   // step successful
+       {
+  
+           if( xerr >= 0 && xerr <= 0.1)
+           { 
+               dt = m_previous_stepsize[2] * 10.0;
+           }
+   
+          if ( xerr > 0.1 && xerr <= 1.2 )
+           {
+               dt = m_previous_stepsize[2] * F;
+           }
+         //  std::cout << " PASS xerr = " << xerr << "   ";
+           return success;
+        }
+
+       if ( xerr > 1.2 ) // step failed
+        {  
+             if ( m_fail > 2)
+            {
+               m_previous_stepsize[2] = 0.5 * m_previous_stepsize[2];
+               m_fail++;
+             }
+
+             if( xerr > 1.2 && xerr <= 10)
+             {     
+                m_previous_stepsize[2] = F * m_previous_stepsize[2]; 
+               m_fail++;
+             } 
+     
+             if( xerr > 10 )
+             { 
+                m_previous_stepsize[2] = 0.1 * m_previous_stepsize[2];
+                m_fail++;
+             }
+        
+           dt = m_previous_stepsize[2];
+           return fail;
+        }
+   }//try_step
+
+   value_type error_do_step(rotbuffer_type_state &m_previous_state,rotbuffer_type_stepsize &m_previous_stepsize)
+   {
+        value_type xerr; // xerr analogous to Z in paper
+        LTE = ( ( m_previous_stepsize[2] + m_previous_stepsize[1] )/6.0 ) * ( ((m_previous_state[3] - m_previous_state[2])/ m_previous_stepsize[2])         
+                  - ((1+(m_previous_stepsize[2]/m_previous_stepsize[1])) * ((m_previous_state[2] - m_previous_state[1])/m_previous_stepsize[1]))
+                  + ( (m_previous_stepsize[2]/(m_previous_stepsize[1] * m_previous_stepsize[0])) * (m_previous_state[1] - m_previous_state[0])) );
+         
+         Z = 1.2 * pow( (ublas::norm_2(abs(LTE))/ Rtol), 1.0/3.0);
+      
+        xerr = Z;
+        return xerr;
+   }
+
+    template< class StateIn >
+    bool resize_impl( const StateIn &x )
+    {
+        bool resized = false;
+        resized |= adjust_size_by_resizeability( m_dxdt , x , typename is_resizeable<deriv_type>::type() );
+        resized |= adjust_size_by_resizeability( m_x , x , typename is_resizeable<state_type>::type() );
+        resized |= adjust_size_by_resizeability( m_b , x , typename is_resizeable<deriv_type>::type() );
+        resized |= adjust_size_by_resizeability( m_jacobi , x , typename is_resizeable<matrix_type>::type() );
+        resized |= adjust_size_by_resizeability( m_pm , x , typename is_resizeable<pmatrix_type>::type() );
+        return resized;
+    }
+
+    void solve( state_type &x , matrix_type &m )
+    {
+        int res = boost::numeric::ublas::lu_factorize( m , m_pm.m_v );
+        if( res != 0 ) exit(0);
+        boost::numeric::ublas::lu_substitute( m , m_pm.m_v , x );
+    }
+
+private:
+
+    value_type m_epsilon;
+    resizer_type m_resizer;
+    wrapped_deriv_type m_dxdt;
+    wrapped_state_type m_x;
+    wrapped_deriv_type m_b;
+    wrapped_matrix_type m_jacobi;
+    wrapped_pmatrix_type m_pm;
+    rotbuffer_type_state m_previous_state;
+    rotbuffer_type_time m_previous_time;
+    rotbuffer_type_stepsize m_previous_stepsize;
+    bool m_flag;
+    int m_fail;
+    state_type LTE;
+    double Z, F;
+    controlled_step_result res;
+    time_type alpha, beta, gamma1, w; 
+};
+}
+}
+}
+
+#endif

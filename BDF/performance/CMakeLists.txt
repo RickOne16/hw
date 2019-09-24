@@ -1,0 +1,3 @@
+add_executable (performance_bdf2 performance_bdf2.cpp)
+add_executable (performance_imp_euler performance_imp_euler.cpp)
+add_executable (performance_rosenbrock performance_rosenbrock.cpp)
